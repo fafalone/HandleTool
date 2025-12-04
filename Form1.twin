@@ -1,18 +1,24 @@
-[Description("HandleTool v1.1")]
+[Description("HandleTool v1.2")]
 [FormDesignerId("C4BC32F0-FD71-4E3E-951C-15F6230C70AE")]
 [PredeclaredId]
 Class Form1
     Option Explicit
     '**********************************************************
-    'HandleTool v1.1.2
+    'HandleTool v1.2.4
     'by Jon Johnson
     '
     'A small utility to list various files/handles in use by a
     'selected process, or to search for which process is using
     'a specific file.
     '
+    'Project repository:
     ' https://github.com/fafalone/HandleTool
     ' 
+    'Version 1.2.4 (04 Dec 2025)
+    '- Enable SE_DEBUG_PRIVILEGE to be able to list/search for
+    '  handles in SYSTEM processes.
+    '- Fix NtPath->DosPath error in some cases from not mapping
+    '  volumes on startup.
     'Version 1.1.2 (04 Dec 2025)
     '- Double click to list handles
     '- In some cases, NtQueryObject for the name would hang, so
@@ -496,7 +502,29 @@ Class Form1
    
     Private Sub Form_Load() Handles Form.Load
         nSortDir = -1
+        Dim hToken          As LongPtr
+        Dim dwIsElevated    As Long
+        Dim dwLength        As Long
+    
+        If OpenProcessToken(GetCurrentProcess, TOKEN_QUERY, hToken) Then
+            If GetTokenInformation(hToken, TokenElevation, dwIsElevated, 4, dwLength) Then
+                If dwIsElevated Then
+                    Dim enabled As Byte
+                    Dim status As NTSTATUS = RtlAdjustPrivilege(SE_DEBUG_PRIVILEGE, 1, 0, enabled)
+                    If NT_SUCCESS(status) Then
+                        Debug.Print "Successfully enabled debug privilege."
+                    Else
+                        Debug.Print "Failed to enable debug privilege. You must run this program as Administrator"
+                    End If
+                Else
+                    Text1.Text = "It's recommended you run this program as Administrator or SYSTEM."
+                End If
+            End If
+            Call CloseHandle(hToken)
+        End If
         
+        MapVolumes()
+
         InitListView()
         
         RefreshProcessList
