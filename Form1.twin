@@ -12,7 +12,7 @@ Class Form1
     'a specific file.
     '
     ' https://github.com/fafalone/HandleTool
-    '
+    ' 
     'Version 1.1.2 (04 Dec 2025)
     '- Double click to list handles
     '- In some cases, NtQueryObject for the name would hang, so
@@ -613,12 +613,10 @@ Class Form1
         Debug.Print "Finished listing handles for " & pid
     End Function
     Public Function NameQueryThreadProc(ByVal lpParameter As LongPtr) As Long
-        CoInitialize(0)
         With CType(Of NAME_QUERY_DATA)(lpParameter)
         .status = NtQueryObject(.hTarget, ObjectNameInformation, ByVal .pBuffer, .cbBuffer, ByVal 0)
         NameQueryThreadProc = 0
         End With
-        CoUninitialize()
     End Function
  
     [ArrayBoundsChecks(False)]
