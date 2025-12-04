@@ -1,10 +1,10 @@
-[Description("HandleTool v1.0")]
+[Description("HandleTool v1.1")]
 [FormDesignerId("C4BC32F0-FD71-4E3E-951C-15F6230C70AE")]
 [PredeclaredId]
 Class Form1
     Option Explicit
     '**********************************************************
-    'HandleTool v1.0.1
+    'HandleTool v1.1.2
     'by Jon Johnson
     '
     'A small utility to list various files/handles in use by a
@@ -12,6 +12,15 @@ Class Form1
     'a specific file.
     '
     ' https://github.com/fafalone/HandleTool
+    '
+    'Version 1.1.2 (04 Dec 2025)
+    '- Double click to list handles
+    '- In some cases, NtQueryObject for the name would hang, so
+    '  the name lookup is now done on a separate thread with a 
+    '  250ms timeout.
+    '- ListView should be single sel
+    '- Section handle display broken
+    '- Fixed some handle leaks
     '
     '03 Dec 2025 - Initial release
     '
@@ -36,6 +45,13 @@ Class Form1
     Private Const sCol0 As String = "Process"
     Private Const sCol1 As String = "PID"
     
+    Private Type NAME_QUERY_DATA
+        hTarget As LongPtr
+        pBuffer As LongPtr
+        cbBuffer As Long
+        status As NTSTATUS
+    End Type
+
     Private nSortKey As Long
     Private Enum LVSortDir
         sortAscending
@@ -138,11 +154,18 @@ Class Form1
         RefreshProcessList()
     End Sub
     
+    Private Sub pbLV_Resize() Handles pbLV.Resize
+        If hLV Then
+            SetWindowPos hLV, 0, 0, 0, pbLV.ScaleWidth, pbLV.ScaleHeight, SWP_NOMOVE Or SWP_NOZORDER
+        End If
+    End Sub
+    
+    
     Private Sub InitListView()
         
  
         Dim dwFlags As Long = WS_CHILD Or WS_VISIBLE Or WS_CLIPSIBLINGS Or WS_CLIPCHILDREN Or _
-                                LVS_REPORT Or LVS_SHOWSELALWAYS Or LVS_AUTOARRANGE Or LVS_ALIGNTOP
+                                LVS_REPORT Or LVS_SHOWSELALWAYS Or LVS_AUTOARRANGE Or LVS_ALIGNTOP Or LVS_SINGLESEL
         Dim dwFlagsEx As Long = WS_EX_CLIENTEDGE
         
         hLV = CreateWindowEx(dwFlagsEx, WC_LISTVIEW, vbNullString, dwFlags, 0, 0, pbLV.ScaleWidth, pbLV.ScaleHeight, _
@@ -470,35 +493,7 @@ Class Form1
     TrimNullW = Left$(startstr, lstrlenW(ByVal StrPtr(startstr)))
     End Function
     
-    Private Function LVSortProc(ByVal lParam1 As LongPtr, ByVal lParam2 As LongPtr, ByVal lParamSort As LongPtr) As Long
-        
-        Dim r As Long
-        
-        If nSortKey = 0 Then 'Sort by name
-            r = StrCmpLogicalW(StrPtr(PLProcesses(lParam1).sDisplayName), StrPtr(PLProcesses(lParam2).sDisplayName))
-            If dbgsc < 10 Then
-                Debug.Print "SortCmp " & PLProcesses(lParam1).sDisplayName & "|" & PLProcesses(lParam2).sDisplayName & "=" & r
-                dbgsc += 1
-            End If
-        ElseIf nSortKey = 1 Then 'Sort by pid
-            If PLProcesses(lParam1).pid = PLProcesses(lParam2).pid Then
-                r = 0
-            Else
-                r = IIf(PLProcesses(lParam1).pid > PLProcesses(lParam2).pid, -1, 1)
-            End If
-            If dbgsc < 10 Then
-                Debug.Print "SortPid " & PLProcesses(lParam1).pid & "|" & PLProcesses(lParam2).pid & "=" & r
-                dbgsc += 1
-            End If
-        End If
-        
-        If lParamSort Then 'sortDescending, invert result
-            Return r * -1
-        Else
-            Return r
-        End If
-    End Function
-    
+   
     Private Sub Form_Load() Handles Form.Load
         nSortDir = -1
         
@@ -523,14 +518,22 @@ Class Form1
     ElseIf (Check4.Value = vbChecked) AndAlso (sType = "Key") Then
         AppendText "Key: " & sName
     ElseIf (Check2.Value = vbChecked) AndAlso (sType = "Section") Then
-        AppendText "Key: " & sName
+        AppendText "Section: " & sName
     ElseIf Check5.Value = vbChecked Then
         AppendText sType & ": " & sName
     End If
     
-    
-    
     End Sub
+    
+    Private Function NeedHandleName(ByVal sType As String) As Boolean
+        If Check5.Value = vbChecked Then Return True
+        If (sType = "File") AndAlso (Check1.Value = vbChecked) Then Return True
+        If (sType = "Directory") AndAlso (Check3.Value = vbChecked) Then Return True
+        If (sType = "Key") AndAlso (Check4.Value = vbChecked) Then Return True
+        If (sType = "Section") AndAlso (Check2.Value = vbChecked) Then Return True
+        Return False
+    End Function
+    
     [ArrayBoundsChecks(False)]
     Private Function ListHandlesForProc(ByVal pid As Long) As Long
         Dim hProc As LongPtr = OpenProcess(PROCESS_QUERY_INFORMATION Or PROCESS_DUP_HANDLE, CFALSE, pid)
@@ -571,128 +574,205 @@ Class Form1
                 End If
                 ReDim nameBuffer(2047)
                 ReDim typeBuffer(1023)
-                status = NtQueryObject(hTarget, ObjectNameInformation, nameBuffer(0), UBound(nameBuffer) + 1, ByVal 0)
                 status2 = NtQueryObject(hTarget, ObjectTypeInformation, typeBuffer(0), UBound(typeBuffer) + 1, ByVal 0)
                 sType = LPWSTRtoStr(CType(Of OBJECT_TYPE_INFORMATION)(VarPtr(typeBuffer(0))).TypeName.Buffer, False)
-                sName = LPWSTRtoStr(CType(Of OBJECT_NAME_INFORMATION)(VarPtr(nameBuffer(0))).Name.Buffer, False)
+ 
+                If NeedHandleName(sType) Then
+                    Dim nd As NAME_QUERY_DATA
+                    Dim hThread As LongPtr
+                    Dim tid As Long
+
+                    nd.hTarget = hTarget
+                    nd.pBuffer = VarPtr(nameBuffer(0))
+                    nd.cbBuffer = UBound(nameBuffer) + 1
+
+                    'Some NtQueryObject calls hang, so look up the name in a separate thread and time it out if too long
+                    'GetFinalPathNameByHandle will hang as well in this situation.
+                    hThread = CreateThread(ByVal 0, 0, AddressOf NameQueryThreadProc, ByVal VarPtr(nd), 0, tid)
+ 
+                    If WaitForSingleObject(hThread, 250) = WAIT_TIMEOUT Then ' 
+                        TerminateThread hThread, 1
+                        sName = "(unavailable)"
+                    Else
+                        If NT_SUCCESS(nd.status) Then  ' 
+                            sName = LPWSTRtoStr(CType(Of OBJECT_NAME_INFORMATION)(VarPtr(nameBuffer(0))).Name.Buffer, False)
+                        Else
+                            sName = "(status=0x" & Hex(nd.status) & ", " & GetNtErrorString(nd.status) & ")"
+                        End If
+                    End If
+ 
+                    CloseHandle hThread
+                End If
                 DisplayHandle(sType, sName)
                 CloseHandle hTarget
+                hTarget = 0
+                 
             Next
         End With
-        
+        CloseHandle hProc
+        Debug.Print "Finished listing handles for " & pid
+    End Function
+    Public Function NameQueryThreadProc(ByVal lpParameter As LongPtr) As Long
+        CoInitialize(0)
+        With CType(Of NAME_QUERY_DATA)(lpParameter)
+        .status = NtQueryObject(.hTarget, ObjectNameInformation, ByVal .pBuffer, .cbBuffer, ByVal 0)
+        NameQueryThreadProc = 0
+        End With
+        CoUninitialize()
     End Function
  
-        [ArrayBoundsChecks(False)]
-        Private Function FindProcsUsingFile(ByVal sFile As String) As Long
-         Dim hFile As LongPtr
-         Dim oa As OBJECT_ATTRIBUTES
-         Dim iosb As IO_STATUS_BLOCK
-         Dim status As NTSTATUS
-         Dim fileName As UNICODE_STRING
-         sFile = "\??\" & sFile
-         RtlInitUnicodeString fileName, StrPtr(sFile)
-         InitializeObjectAttributes(oa, _
-                                    VarPtr(fileName), _
-                                    OBJ_CASE_INSENSITIVE, _
-                                    0, _
-                                    0)
-         
-         status = NtOpenFile(hFile, FILE_READ_ATTRIBUTES Or SYNCHRONIZE, oa, iosb, _
-                                FILE_SHARE_READ Or FILE_SHARE_WRITE Or FILE_SHARE_DELETE, _
-                                FILE_NON_DIRECTORY_FILE Or FILE_SYNCHRONOUS_IO_NONALERT)
-         
-         If NT_SUCCESS(status) Then
-             Dim cbBuf As Long = 1024
-             Dim buf() As Byte
-             ZeroMemory iosb, LenB(iosb)
-             ReDim buf(cbBuf - 1)
-             Do
-                 status = NtQueryInformationFile(hFile, iosb, buf(0), cbBuf, FileProcessIdsUsingFileInformation)
-                 If (status = STATUS_BUFFER_OVERFLOW) Or (status = STATUS_BUFFER_TOO_SMALL) Or (status = STATUS_INFO_LENGTH_MISMATCH) Then
-                     cbBuf *= 2
-                     ReDim buf(cbBuf - 1)
-                 Else
-                     Exit Do
-                 End If
-             Loop
-             
-             NtClose(hFile)
-             
-             If NT_SUCCESS(status) Then
-                 With CType(Of FILE_PROCESS_IDS_USING_FILE_INFORMATION)(VarPtr(buf(0)))
-                     If .NumberOfProcessIdsInList Then
-                        Text1.Text = "Processes using " & sFile & vbCrLf
-                        Text1.Text &= "==========================" & vbCrLf
-                        For j As Long = 0 To .NumberOfProcessIdsInList - 1
-                            AppendUsingFile sFile, CLng(.ProcessIdList(j))
-                        Next
-                    Else
-                        Text1.Text = "No processes identified using " & sFile
-                    End If
-                 End With
-             End If
-         End If
-    End Function
-    Private Sub AppendUsingFile(sFile As String, ByVal pid As Long)
-        Dim idx As Long
-        For i As Long = 0 To UBound(PLProcesses)
-            If PLProcesses(i).pid = pid Then
-                If PLProcesses(i).sCommandLine <> "" Then
-                    Text1.Text &= PLProcesses(i).sDisplayName & " (" & pid & "), CommandLine=" & PLProcesses(i).sCommandLine & vbCrLf
-                Else
-                    Text1.Text &= PLProcesses(i).sDisplayName & " (" & pid & "), ProcessPath=" & PLProcesses(i).sFullPath & vbCrLf
-                End If
-            End If
-        Next
-    End Sub
-
-    Private Function Subclass2(hWnd As LongPtr, lpFN As LongPtr, Optional uId As LongPtr = 0&, Optional dwRefData As LongPtr = 0&) As Boolean
-    If uId = 0 Then uId = hWnd
-        Subclass2 = SetWindowSubclass(hWnd, lpFN, uId, dwRefData):      Debug.Assert Subclass2
-    End Function
-
-    Private Function UnSubclass2(hWnd As LongPtr, ByVal lpFN As LongPtr, pid As LongPtr) As Boolean
-        UnSubclass2 = RemoveWindowSubclass(hWnd, lpFN, pid)
-    End Function
-    Private Function LVWndProc(ByVal lng_hWnd As LongPtr, ByVal uMsg As Long, ByVal wParam As LongPtr, ByVal lParam As LongPtr, ByVal uIdSubclass As LongPtr, ByVal dwRefData As LongPtr) As LongPtr
+    [ArrayBoundsChecks(False)]
+    Private Function FindProcsUsingFile(ByVal sFile As String) As Long
+        Dim hFile As LongPtr
+        Dim oa As OBJECT_ATTRIBUTES
+        Dim iosb As IO_STATUS_BLOCK
+        Dim status As NTSTATUS
+        Dim fileName As UNICODE_STRING
+        sFile = "\??\" & sFile
+        RtlInitUnicodeString fileName, StrPtr(sFile)
+        InitializeObjectAttributes(oa, _
+                                VarPtr(fileName), _
+                                OBJ_CASE_INSENSITIVE, _
+                                0, _
+                                0)
         
-        Select Case uMsg
+        status = NtOpenFile(hFile, FILE_READ_ATTRIBUTES Or SYNCHRONIZE, oa, iosb, _
+                            FILE_SHARE_READ Or FILE_SHARE_WRITE Or FILE_SHARE_DELETE, _
+                            FILE_NON_DIRECTORY_FILE Or FILE_SYNCHRONOUS_IO_NONALERT)
+        
+        If NT_SUCCESS(status) Then
+            Dim cbBuf As Long = 1024
+            Dim buf() As Byte
+            ZeroMemory iosb, LenB(iosb)
+            ReDim buf(cbBuf - 1)
+            Do
+                status = NtQueryInformationFile(hFile, iosb, buf(0), cbBuf, FileProcessIdsUsingFileInformation)
+                If (status = STATUS_BUFFER_OVERFLOW) Or _
+                (status = STATUS_BUFFER_TOO_SMALL) Or _
+                (status = STATUS_INFO_LENGTH_MISMATCH) Then
+                    cbBuf *= 2
+                    ReDim buf(cbBuf - 1)
+                Else
+                    Exit Do
+                End If
+            Loop
             
-        Case WM_NOTIFY
-            Dim NM As NMHDR
-            Dim nmlv As NMLISTVIEW
-            CopyMemory NM, ByVal lParam, LenB(NM)
-            Select Case NM.Code
-            Case LVN_COLUMNCLICK
-                    Dim nCol As Long
-                    CopyMemory nmlv, ByVal lParam, LenB(nmlv)
-                    nCol = CLng(GetHDItemlParam(hLVCHdr, nmlv.iSubItem))
-                    If nCol = 1 Then
-                        nSortKey = 0
-                    Else
-                        nSortKey = 1
-                    End If
-                    If nSortDir = -1 Then
-                        nSortDir = 0
-                    ElseIf nSortDir = 0 Then
-                        nSortDir = 1
-                    Else
-                        nSortDir = 0
-                    End If
-                    Debug.Print "LVC ColClick " & nCol, nSortKey, nSortDir
-                    Dim lpfn As LongPtr = AddressOf LVSortProc
-                    Call SendMessage(hLV, LVM_SORTITEMS, nSortDir, ByVal lpfn)
-  
-            End Select
+            NtClose(hFile)
             
-            
-            Case WM_DESTROY
-                Call UnSubclass2(lng_hWnd, AddressOf LVWndProc, uIdSubclass)
-        End Select
+            If NT_SUCCESS(status) Then
+                With CType(Of FILE_PROCESS_IDS_USING_FILE_INFORMATION)(VarPtr(buf(0)))
+                    If .NumberOfProcessIdsInList Then
+                    Text1.Text = "Processes using " & sFile & vbCrLf
+                    Text1.Text &= "==========================" & vbCrLf
+                    For j As Long = 0 To .NumberOfProcessIdsInList - 1
+                        AppendUsingFile sFile, CLng(.ProcessIdList(j))
+                    Next
+                Else
+                    Text1.Text = "No processes identified using " & sFile
+                End If
+                End With
+            End If
+        End If
+End Function
+Private Sub AppendUsingFile(sFile As String, ByVal pid As Long)
+    Dim idx As Long
+    For i As Long = 0 To UBound(PLProcesses)
+        If PLProcesses(i).pid = pid Then
+            If PLProcesses(i).sCommandLine <> "" Then
+                Text1.Text &= PLProcesses(i).sDisplayName & " (" & pid & "), CommandLine=" & PLProcesses(i).sCommandLine & vbCrLf
+            Else
+                Text1.Text &= PLProcesses(i).sDisplayName & " (" & pid & "), ProcessPath=" & PLProcesses(i).sFullPath & vbCrLf
+            End If
+        End If
+    Next
+End Sub
 
-    LVWndProc = DefSubclassProc(lng_hWnd, uMsg, wParam, lParam)
+Private Function Subclass2(hWnd As LongPtr, lpFN As LongPtr, Optional uId As LongPtr = 0&, Optional dwRefData As LongPtr = 0&) As Boolean
+If uId = 0 Then uId = hWnd
+    Subclass2 = SetWindowSubclass(hWnd, lpFN, uId, dwRefData):      Debug.Assert Subclass2
+End Function
 
-    End Function
+Private Function UnSubclass2(hWnd As LongPtr, ByVal lpFN As LongPtr, pid As LongPtr) As Boolean
+    UnSubclass2 = RemoveWindowSubclass(hWnd, lpFN, pid)
+End Function
+
+Private Function LVSortProc(ByVal lParam1 As LongPtr, ByVal lParam2 As LongPtr, ByVal lParamSort As LongPtr) As Long
     
+    Dim r As Long
+    
+    If nSortKey = 0 Then 'Sort by name
+        r = StrCmpLogicalW(StrPtr(PLProcesses(lParam1).sDisplayName), StrPtr(PLProcesses(lParam2).sDisplayName))
+        ' If dbgsc < 10 Then
+        '     Debug.Print "SortCmp " & PLProcesses(lParam1).sDisplayName & "|" & PLProcesses(lParam2).sDisplayName & "=" & r
+        '     dbgsc += 1
+        ' End If
+    ElseIf nSortKey = 1 Then 'Sort by pid
+        If PLProcesses(lParam1).pid = PLProcesses(lParam2).pid Then
+            r = 0
+        Else
+            r = IIf(PLProcesses(lParam1).pid > PLProcesses(lParam2).pid, -1, 1)
+        End If
+        ' If dbgsc < 10 Then
+        '     Debug.Print "SortPid " & PLProcesses(lParam1).pid & "|" & PLProcesses(lParam2).pid & "=" & r
+        '     dbgsc += 1
+        ' End If
+    End If
+    
+    If lParamSort Then 'sortDescending, invert result
+        Return r * -1
+    Else
+        Return r
+    End If
+End Function
+
+Private Function LVWndProc(ByVal lng_hWnd As LongPtr, ByVal uMsg As Long, ByVal wParam As LongPtr, ByVal lParam As LongPtr, ByVal uIdSubclass As LongPtr, ByVal dwRefData As LongPtr) As LongPtr
+    
+    Select Case uMsg
+        
+    Case WM_NOTIFY
+        Dim NM As NMHDR
+        Dim nmlv As NMLISTVIEW
+        CopyMemory NM, ByVal lParam, LenB(NM)
+        Select Case NM.Code
+        Case LVN_COLUMNCLICK
+                Dim nCol As Long
+                CopyMemory nmlv, ByVal lParam, LenB(nmlv)
+                nCol = CLng(GetHDItemlParam(hLVCHdr, nmlv.iSubItem))
+                If nCol = 1 Then
+                    nSortKey = 0
+                Else
+                    nSortKey = 1
+                End If
+                If nSortDir = -1 Then
+                    nSortDir = 0
+                ElseIf nSortDir = 0 Then
+                    nSortDir = 1
+                Else
+                    nSortDir = 0
+                End If
+                Debug.Print "LVC ColClick " & nCol, nSortKey, nSortDir
+                Dim lpfn As LongPtr = AddressOf LVSortProc
+                Call SendMessage(hLV, LVM_SORTITEMS, nSortDir, ByVal lpfn)
+                
+        Case NM_DBLCLK
+            Dim lp As LongPtr
+            Dim li As Long = CType(Of NMITEMACTIVATE)(lParam).iItem
+            If li >= 0 Then
+                Text1.Text = ""
+                lp = GetLVItemlParam(hLV, li)
+                ListHandlesForProc(PLProcesses(CLng(lp)).pid)
+            End If
+        End Select
+        
+        
+        Case WM_DESTROY
+            Call UnSubclass2(lng_hWnd, AddressOf LVWndProc, uIdSubclass)
+    End Select
+
+LVWndProc = DefSubclassProc(lng_hWnd, uMsg, wParam, lParam)
+
+End Function
+    
+
 
 End Class
