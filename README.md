@@ -1,4 +1,4 @@
-# HandleTool v1.1
+# HandleTool v1.2
 List Files and other handles, find process using file
 
 <img width="655" height="329" alt="image" src="https://github.com/user-attachments/assets/86ca3346-cb3c-49fd-8938-10f0b4ca1786" />
@@ -7,6 +7,12 @@ List Files and other handles, find process using file
 
 This is a small utility that lists files and several other (or all) handle types in use by a specified process. It also has a function to list all processes that have an open handle to a specified file (if the file can't be moved/deleted/etc because it's "in use", this will show the program(s) holding it open). 
 
+ **Update (04 Dec 2025) - Version 1.2**
+- Enable SE_DEBUG_PRIVILEGE to be able to list/search for
+   handles in SYSTEM processes.
+- Fix NtPath->DosPath error in some cases from not mapping
+    '  volumes on startup.
+    
 **Update (04 Dec 2025) - Version 1.1**
 - Double click to list handles
 - In some cases, NtQueryObject for the name would hang, so
